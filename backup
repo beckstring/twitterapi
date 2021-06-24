@@ -1,0 +1,570 @@
+rm(list = ls()) #clear workspace
+library(dplyr)
+library(doParallel)
+library(caret)
+library(smotefamily)
+
+
+setwd("/Users/philippbecker/Documents/Uni SoSe 21/Data Science and Marketing Analytics/Project/Final Documents") #set working directory
+
+source("DailyLevelData_analysis_functions.r")
+
+
+# ----
+# Loading data "do not run", unless you know what you are doing.
+if(0){
+  #load data
+  yelp_data <- read.csv("DailyLevel_data_Imputed.csv",header=TRUE,skipNul = T) #read csv file
+  yelp_data$date <- as.Date(yelp_data$date)
+  yelp_data$X=NULL
+  
+  #---- read the temperature data
+  wear=extractweather(yelp_data)
+  
+  # take the averages across stations for each coordinate
+  weather=weardailyavg(wear)
+  
+  
+  
+  dates=sort(unique(yelp_data$date))
+  weatherstations=as.data.frame(t(sapply(weather,function(x){colMeans(x$range)})))
+  
+  # adding weather data to yelp_data
+  if(0){
+    stations_by=t(apply(yelp_data[,c("business_lat","business_long")],1,
+                        function(x){a=sort((x[1]-weatherstations$rangelat)^2+
+                                             (x[2]-weatherstations$rangelong)^2,index.return=T)
+                        return(a$ix[1:50])})) # finding the 50 closest stations
+    
+    # add for example, temperature forecasts to the weather data
+    for(i in 1:length(weather)){
+      if(nrow(weather[[i]]$data)==0)
+        next
+      store_weather=weather[[i]]$data
+      store_weather$TOBS_1=c(store_weather$TOBS[2:nrow(store_weather)],NA)
+      store_weather$TOBS_2=c(store_weather$TOBS[3:nrow(store_weather)],NA,NA)
+      store_weather$TOBS_3=c(store_weather$TOBS[4:nrow(store_weather)],NA,NA,NA)
+      store_weather$TOBS_4=c(store_weather$TOBS[5:nrow(store_weather)],NA,NA,NA,NA)
+      weather[[i]]$data=store_weather
+    }
+    weatherinf=colnames(store_weather)[-1] # which weather variables are available?
+    
+    yelp_data_weather=NULL
+    for(i in 1:length(weather)){
+      k=1 # start with the closest station
+      stores_in=stations_by[,k]==i
+      if(sum(stores_in)==0)
+        next
+      store_weather=weather[[i]]$data
+      
+      temp=yelp_data[stores_in,]
+      temp=merge(temp,store_weather,by.x="date",by.y="DATE",all.x=T)
+      yelp_data_weather=rbind(yelp_data_weather,temp)
+      print(i)
+    }
+    
+    # now deal with the missings, by going to the next possible station
+    temp_indx=is.na(yelp_data_weather[,"TOBS"])|is.na(yelp_data_weather[,"PRCP"])
+    k_changed=NULL
+    for(i in which(temp_indx)){
+      temp_date=yelp_data_weather[i,]$date
+      for(k in 2:ncol(stations_by)){
+        temp=weather[[stations_by[i,k]]]$data
+        if(!is.na(as.numeric(temp[temp$DATE==temp_date,"TOBS"]))&!is.na(as.numeric(temp[temp$DATE==temp_date,"PRCP"])))
+          break
+      }
+      k_changed=c(k_changed,k)
+      
+      yelp_data_weather[i,weatherinf]=temp[temp$DATE==temp_date,-1]
+      #print(i)
+    }
+    
+    # add weekends and quarters
+    temp=weekdays(yelp_data_weather$date,abbreviate = T)
+    yelp_data_weather$WE=temp=="Sa"|temp=="So"
+    
+    yelp_data_weather$Quarter=as.factor(quarters(yelp_data_weather$date))
+    
+    #save(file="yelp_data_weather.RData",list=c("yelp_data_weather"))
+    #write.csv(yelp_data_weather,file="yelp_data_weather.csv")
+    
+  }
+  
+}
+# END OF:Loading data "do not run", unless you know what you are doing.
+
+# ----
+# Importing and adjusting the yelp-data + weather data
+yelp_data_weather=read.csv(file="yelp_data_weather.csv")
+#load("yelp_data_weather.RData")
+
+# Load own data
+yelp_pb <- read.csv("dsma_df_merged.csv",header=TRUE, na.strings="NULL")
+
+#Load attribute data
+attributes <- read.csv("attributes_cleaned_2.csv", na.strings="NA", header=TRUE, sep=";")
+summary(attributes)
+#Select only attributes with diverse distribution
+attributes <- select(attributes, business_id, lot, street, BikeParking, GoodForKids, RestaurantsTakeOut, OutdoorSeating, WiFi, RestaurantsReservations, casual, dinner, lunch)
+
+#Fill missings in na's (could be done at later stage using other variables)
+init = mice(attributes, maxit=0)
+meth = init$method
+predM = init$predictorMatrix
+predM[, c("business_id")]=0
+
+MiceImputedData <- mice(attributes, m=2,  method="pmm", predictorMatrix=predM, seed = 500)
+summary(MiceImputedData)
+
+attributes<- complete(MiceImputedData,2)
+##########
+
+# Create new key for merging
+yelp_data_weather <- within(yelp_data_weather,  key <- paste( date, business_lat, business_long, cum_max_us_fans ,sep="_"))
+
+# Do the same for own data
+yelp_pb <- within(yelp_pb,  key <- paste( date, business_lat, business_long, cum_max_us_fans ,sep="_"))
+
+#Join attributes using business_id
+
+yelp_pb <- yelp_pb %>%
+  inner_join(attributes, by = "business_id")
+
+# Keep only new columnss
+yelp_pb <- yelp_pb[,20:41]
+
+# Check whether identifies is unique
+uniq <- unique(yelp_data_weather$key)
+# Count length of df
+length(uniq)
+
+# And for the other df
+uniq2 <- unique(yelp_pb$key)
+# Count length of df
+length(uniq2)
+
+##########
+
+
+# Merge the two data frames
+yelp_merged <- merge(yelp_data_weather, yelp_pb, by='key')
+
+# Drop key column again
+yelp_merged$key <- NULL
+
+
+#Write as csv
+write.csv(yelp_merged, "yelp_merged_final.csv", row.names= FALSE)
+###########
+
+
+########### Data Cleaning ##################################################################
+
+yelp_merged <- read.csv("yelp_merged_final.csv")
+
+summary(yelp_merged)
+
+# Convert attributes to the right type
+yelp_merged$lot <- as.logical(ifelse(yelp_merged$lot=="True", TRUE,FALSE))
+yelp_merged$street <- as.logical(ifelse(yelp_merged$street=="True", TRUE,FALSE))
+yelp_merged$BikeParking <- as.logical(ifelse(yelp_merged$BikeParking=="True", TRUE,FALSE))
+yelp_merged$GoodForKids <- as.logical(ifelse(yelp_merged$GoodForKids=="True", TRUE,FALSE))
+yelp_merged$RestaurantsTakeOut <- as.logical(ifelse(yelp_merged$RestaurantsTakeOut=="True", TRUE,FALSE))
+yelp_merged$OutdoorSeating <- as.logical(ifelse(yelp_merged$OutdoorSeating=="True", TRUE,FALSE))
+yelp_merged$WiFi <- as.logical(ifelse(yelp_merged$WiFi=="True", TRUE,FALSE))
+yelp_merged$RestaurantsReservations <- as.logical(ifelse(yelp_merged$RestaurantsReservations=="True", TRUE,FALSE))
+yelp_merged$casual <- as.logical(ifelse(yelp_merged$casual=="True", TRUE,FALSE))
+yelp_merged$dinner <- as.logical(ifelse(yelp_merged$dinner=="True", TRUE,FALSE))
+yelp_merged$lunch <- as.logical(ifelse(yelp_merged$lunch=="True", TRUE,FALSE))
+
+# Check whether conversion worked
+library(dplyr)
+glimpse(yelp_merged)
+
+# Several variables have missings
+# SNOW SNWD TMAX TMIN TOBS_1 TOBS_2 TOBS_3 TOBS_4 lot street BikeParking GoodForKids
+# RestaurantsTakeOut OutdoorSeating WiFi RestaurantsReservations casual dinner lunch
+#	SNWD = Snow depth 
+# TOBS = Time of observation error https://climateaudit.org/2007/09/24/tobs/
+
+# Visualize missing values
+
+#yelp_merged <- yelp_merged[order(as.Date(yelp_merged$date, format="%Y-%m-%d")),]
+# Sort data by business_lat (Breitengerade)
+yelp_merged <- yelp_merged[order(yelp_merged$business_lat),]
+library(visdat)
+vis_miss(yelp_merged, warn_large_data = FALSE)
+# Data is NOT completely missing at random
+# Snow data seems to be missing for low values of business_lat (Westcoast)
+# yelp_merged[11000,] ~roughly till business_lat 36.01544 data is missing
+
+yelp_merged <- yelp_merged[order(yelp_merged$business_long),]
+vis_miss(yelp_merged, warn_large_data = FALSE)
+# Data is NOT completely missing at random
+# yelp_merged[15000,] missing values start from here onwards
+# 
+
+# replace missings for weather data by median as it is not as sensitive to outliers as mean
+yelp_merged$SNOW[is.na(yelp_merged$SNOW)] <- round(median(yelp_merged$SNOW, na.rm = TRUE))
+yelp_merged$SNWD[is.na(yelp_merged$SNWD)] <- round(median(yelp_merged$SNWD, na.rm = TRUE))
+yelp_merged$TMAX[is.na(yelp_merged$TMAX)] <- round(median(yelp_merged$TMAX, na.rm = TRUE))
+yelp_merged$TMIN[is.na(yelp_merged$TMIN)] <- round(median(yelp_merged$TMIN, na.rm = TRUE))
+yelp_merged$TOBS_1[is.na(yelp_merged$TOBS_1)] <- round(median(yelp_merged$TOBS_1, na.rm = TRUE))
+yelp_merged$TOBS_2[is.na(yelp_merged$TOBS_2)] <- round(median(yelp_merged$TOBS_2, na.rm = TRUE))
+yelp_merged$TOBS_3[is.na(yelp_merged$TOBS_3)] <- round(median(yelp_merged$TOBS_3, na.rm = TRUE))
+yelp_merged$TOBS_4[is.na(yelp_merged$TOBS_4)] <- round(median(yelp_merged$TOBS_4, na.rm = TRUE))
+
+# For attributes choose the variable that is more "likely" based on majority count
+yelp_merged$lot[is.na(yelp_merged$lot)]<- ifelse(sum(yelp_merged$lot==TRUE, na.rm=TRUE) > sum(yelp_merged$lot==FALSE, na.rm=TRUE),TRUE,FALSE)
+yelp_merged$street[is.na(yelp_merged$street)]<- ifelse(sum(yelp_merged$street==TRUE, na.rm=TRUE) > sum(yelp_merged$street==FALSE, na.rm=TRUE),TRUE,FALSE)
+yelp_merged$BikeParking[is.na(yelp_merged$BikeParking)]<- ifelse(sum(yelp_merged$BikeParking==TRUE, na.rm=TRUE) > sum(yelp_merged$BikeParking==FALSE, na.rm=TRUE),TRUE,FALSE)
+yelp_merged$GoodForKids[is.na(yelp_merged$GoodForKids)]<- ifelse(sum(yelp_merged$GoodForKids==TRUE, na.rm=TRUE) > sum(yelp_merged$GoodForKids==FALSE, na.rm=TRUE),TRUE,FALSE)
+yelp_merged$RestaurantsTakeOut[is.na(yelp_merged$RestaurantsTakeOut)]<- ifelse(sum(yelp_merged$RestaurantsTakeOut==TRUE, na.rm=TRUE) > sum(yelp_merged$RestaurantsTakeOut==FALSE, na.rm=TRUE),TRUE,FALSE)
+yelp_merged$OutdoorSeating[is.na(yelp_merged$OutdoorSeating)]<- ifelse(sum(yelp_merged$OutdoorSeating==TRUE, na.rm=TRUE) > sum(yelp_merged$OutdoorSeating==FALSE, na.rm=TRUE),TRUE,FALSE)
+yelp_merged$WiFi[is.na(yelp_merged$WiFi)]<- ifelse(sum(yelp_merged$WiFi==TRUE, na.rm=TRUE) > sum(yelp_merged$WiFi==FALSE, na.rm=TRUE),TRUE,FALSE)
+yelp_merged$RestaurantsReservations[is.na(yelp_merged$RestaurantsReservations)]<- ifelse(sum(yelp_merged$RestaurantsReservations==TRUE, na.rm=TRUE) > sum(yelp_merged$RestaurantsReservations==FALSE, na.rm=TRUE),TRUE,FALSE)
+yelp_merged$casual[is.na(yelp_merged$casual)]<- ifelse(sum(yelp_merged$casual==TRUE, na.rm=TRUE) > sum(yelp_merged$casual==FALSE, na.rm=TRUE),TRUE,FALSE)
+yelp_merged$dinner[is.na(yelp_merged$dinner)]<- ifelse(sum(yelp_merged$dinner==TRUE, na.rm=TRUE) > sum(yelp_merged$dinner==FALSE, na.rm=TRUE),TRUE,FALSE)
+yelp_merged$lunch[is.na(yelp_merged$lunch)]<- ifelse(sum(yelp_merged$lunch==TRUE, na.rm=TRUE) > sum(yelp_merged$lunch==FALSE, na.rm=TRUE),TRUE,FALSE)
+
+
+library(dplyr)
+summary(yelp_merged)
+glimpse(yelp_merged)
+
+
+boxplot(yelp_merged$SNOW)
+table(yelp_merged$SNOW)
+# Only few values ~400, majority is 28751
+
+# Check for outliers
+
+numeric_names <- c("SNOW", "SNWD", "TMAX", "TMIN", "TOBS_1", "TOBS_2", "TOBS_3", "TOBS_4")
+
+# Tutorial: https://www.r-bloggers.com/2020/01/how-to-remove-outliers-in-r/
+# User IGR to classify outliers and then replace these with the "medians"
+
+for (col_name in numeric_names){
+  Q <- quantile(yelp_merged[,col_name], probs=c(.25, .75), na.rm = FALSE)
+  iqr <- IQR(yelp_merged[,col_name])
+  up <-  Q[2]+1.5*iqr # Upper Range  
+  low<- Q[1]-1.5*iqr # Lower Range
+  print(length(yelp_merged[!(yelp_merged[,col_name] > (Q[1] - 1.5*iqr) & yelp_merged[,col_name] < (Q[2]+1.5*iqr)),col_name]))
+  yelp_merged[!(yelp_merged[,col_name] > (Q[1] - 1.5*iqr) & yelp_merged[,col_name] < (Q[2]+1.5*iqr)),col_name] <- median(yelp_merged[,col_name], na.rm=TRUE)}
+
+
+# some adjustments to the imported data
+yelp_data=yelp_merged
+
+yelp_data$date = as.Date(yelp_data$date)
+yelp_data$ch_in_string[yelp_data$ch_in>=1]="ch_in"
+yelp_data$ch_in_string[yelp_data$ch_in==0]="Noch_in"
+yelp_data$ch_in_string <- as.factor(yelp_data$ch_in_string)
+yelp_data$ch_in_string <- relevel(yelp_data$ch_in_string,ref="ch_in") # since the performance evaluations are mainly made
+# to check for the minority class - in our case Noch_in
+
+
+yelp_data$business_park=as.factor(yelp_data$business_park)
+yelp_data$business_open=as.factor(yelp_data$business_open)
+yelp_data$business_cat=as.factor(yelp_data$business_cat)
+yelp_data$WE=as.factor(yelp_data$WE)
+yelp_data$Quarter=as.factor(yelp_data$Quarter)
+
+
+
+glimpse(yelp_merged)
+yelp_merged$name <- NULL
+yelp_merged$X <- NULL
+yelp_merged$date <- NULL
+yelp_merged$business_lat <- NULL
+yelp_merged$business_long <- NULL
+
+
+
+library(rsample)      # data splitting 
+# Create training and testing data
+set.seed(2021)
+yelp_split <- initial_split(yelp_merged, prop = .8)
+yelp_train <- training(yelp_split)
+yelp_test  <- testing(yelp_split)
+
+write.csv(yelp_train, "yelp_train.csv",row.names= TRUE)
+write.csv(yelp_test, "yelp_test.csv",row.names= TRUE)
+
+
+
+
+####### Data Analysis Preparation ############################################################
+
+# Store performance information in this data frame
+results_df <- setNames(data.frame(matrix(ncol = 9, nrow = 10)), c( "model_type", "auc","accuracy", "sensitivity", "specificity", "precision" ,"f1", "training_time", "prediction_time"))
+
+# Define cut-off threshold
+threshold <- sum(as.numeric(yelp_merged$ch_in)) / nrow(yelp_merged)
+
+library(h2o)
+h2o.init(nthreads = -1)
+glimpse(yelp_merged)
+
+# Convert ch_in to factor for random forests
+yelp_merged$ch_in -> as.factor(yelp_merged$ch_in)
+
+# Select predictors for the models
+predictors <- names(yelp_merged)
+predictors <- predictors[predictors!="ch_in"]
+response <- "ch_in"
+
+train <- h2o.importFile("yelp_train.csv")
+test <- h2o.importFile("yelp_test.csv")
+
+
+####### Data Analysis ############################################################
+
+
+####### 1) Random forests ############################################################
+
+
+model_type <- "rf_baseline"
+algo_num <- 1
+
+# Measure time for training
+train_time_start <- proc.time()  # Start time
+
+# Train the model
+yelp_rf <- h2o.randomForest(x = predictors,
+                            y = response,
+                            ntrees = 200,
+                            max_depth = 5,
+                            min_rows = 10,
+                            calibrate_model = FALSE,
+                            binomial_double_trees = TRUE,
+                            training_frame = train,
+                            seed = 2021,
+                            validation_frame = test)
+
+train_time <- proc.time() - train_time_start  # End time 
+train_time_sec <- train_time['elapsed'] # Get time
+
+
+# Eval performance:
+perf <- h2o.performance(yelp_rf)
+
+# Generate predictions
+predict_time_start <- proc.time() # Start time
+
+# Generate predictions on a validation set (if necessary):
+predict <- h2o.predict(yelp_rf, newdata = test)
+
+predict_time <- proc.time() - predict_time_start # End time 
+predict_time_sec <- predict_time['elapsed'] # Get time
+
+
+df <- data.frame(matrix(unlist(as.list(predict)), nrow=length(as.list(predict)), byrow=TRUE))
+colnames(df) <- c("prediction")
+
+
+# Get AUC
+library(pROC)
+roc_baseline <- roc(yelp_test$ch_in,df$prediction, percent=TRUE, plot=TRUE, print.auc=TRUE,grid=TRUE)
+
+
+# Adjust prediction here
+yelp_test$predict_rf <- factor(ifelse(df$prediction>threshold,1,0),labels=c("No ch_in","ch_in"))
+
+### Check accuracy with the confusion matrix ####
+library(caret)
+conf_matrix <- confusionMatrix(yelp_test$predict_rf,factor(yelp_test$ch_in,labels=c("No ch_in","ch_in")), 
+                                   positive="ch_in",dnn = c("Prediction", "Actual Data"))
+
+
+# Get relevant measures
+auc <- roc_baseline$auc
+accuracy <- conf_matrix$overall["Accuracy"]
+sensitivity <- conf_matrix$byClass["Sensitivity"]
+specificity <- conf_matrix$byClass["Specificity"]
+precision <- conf_matrix$byClass["Precision"]
+f1 <- conf_matrix$byClass["F1"]
+
+# Store results in results_df
+results_df$model_type[algo_num] <- model_type
+results_df$auc[algo_num] <- auc
+results_df$accuracy[algo_num] <- accuracy
+results_df$sensitivity[algo_num] <- sensitivity
+results_df$specificity[algo_num] <- specificity
+results_df$precision[algo_num] <- precision
+results_df$f1[algo_num] <- f1
+results_df$training_time[algo_num] <- train_time_sec
+results_df$prediction_time[algo_num] <- predict_time_sec
+
+
+####### 1) End of Random forests ############################################################
+
+
+
+####### 2) Deep Learning ############################################################
+
+
+model_type <- "dl_baseline"
+algo_num <- 2
+
+# Measure time for training
+train_time_start <- proc.time()  # Start time
+
+# Build and train the model:
+yelp_dl <- h2o.deeplearning(x = predictors,
+                       y = response,
+                       distribution = "poisson",
+                       hidden = c(1),
+                       epochs = 1000,
+                       train_samples_per_iteration = -1,
+                       reproducible = TRUE,
+                       activation = "Tanh",
+                       single_node_mode = FALSE,
+                       balance_classes = FALSE,
+                       force_load_balance = FALSE,
+                       seed = 2021,
+                       score_training_samples = 0,
+                       score_validation_samples = 0,
+                       training_frame = train,
+                       validation_frame = test,
+                       stopping_rounds = 0)
+
+
+train_time <- proc.time() - train_time_start  # End time 
+train_time_sec <- train_time['elapsed'] # Get time
+
+
+# Eval performance:
+perf <- h2o.performance(yelp_dl)
+perf
+# Generate predictions
+predict_time_start <- proc.time() # Start time
+
+# Generate predictions on a validation set (if necessary):
+predict <- h2o.predict(yelp_dl, newdata = test)
+
+predict_time <- proc.time() - predict_time_start # End time 
+predict_time_sec <- predict_time['elapsed'] # Get time
+
+
+df <- data.frame(matrix(unlist(as.list(predict)), nrow=length(as.list(predict)), byrow=TRUE))
+colnames(df) <- c("prediction")
+
+
+# Get AUC
+library(pROC)
+roc_baseline <- roc(yelp_test$ch_in,df$prediction, percent=TRUE, plot=TRUE, print.auc=TRUE,grid=TRUE)
+
+
+# Adjust prediction here
+yelp_test$predict_dl <- factor(ifelse(df$prediction>threshold,1,0),labels=c("No ch_in","ch_in"))
+
+### Check accuracy with the confusion matrix ####
+library(caret)
+conf_matrix <- confusionMatrix(yelp_test$predict_dl,factor(yelp_test$ch_in,labels=c("No ch_in","ch_in")), 
+                               positive="ch_in",dnn = c("Prediction", "Actual Data"))
+
+
+# Get relevant measures
+auc <- roc_baseline$auc
+accuracy <- conf_matrix$overall["Accuracy"]
+sensitivity <- conf_matrix$byClass["Sensitivity"]
+specificity <- conf_matrix$byClass["Specificity"]
+precision <- conf_matrix$byClass["Precision"]
+f1 <- conf_matrix$byClass["F1"]
+
+# Store results in results_df
+results_df$model_type[algo_num] <- model_type
+results_df$auc[algo_num] <- auc
+results_df$accuracy[algo_num] <- accuracy
+results_df$sensitivity[algo_num] <- sensitivity
+results_df$specificity[algo_num] <- specificity
+results_df$precision[algo_num] <- precision
+results_df$f1[algo_num] <- f1
+results_df$training_time[algo_num] <- train_time_sec
+results_df$prediction_time[algo_num] <- predict_time_sec
+
+
+####### 2) End of Deep Learning ############################################################
+
+
+####### 3) Support Vector Machines ############################################################
+
+
+model_type <- "svm_baseline"
+algo_num <- 3
+
+train$ch_in <- as.factor(train$ch_in)
+test$ch_in <- as.factor(test$ch_in)
+
+
+# Measure time for training
+train_time_start <- proc.time()  # Start time
+
+# Build and train the model:
+yelp_svm <- h2o.psvm(gamma = 0.01,
+                     rank_ratio = 0.1,
+                     x = predictors,
+                     y = response,
+                     training_frame = train,
+                     validation_frame = test,
+                     disable_training_metrics = FALSE)
+
+
+train_time <- proc.time() - train_time_start  # End time 
+train_time_sec <- train_time['elapsed'] # Get time
+
+
+# Eval performance:
+perf <- h2o.performance(yelp_svm)
+perf
+# Generate predictions
+predict_time_start <- proc.time() # Start time
+
+# Generate predictions on a validation set (if necessary):
+predict <- h2o.predict(yelp_svm , newdata = test)
+
+predict_time <- proc.time() - predict_time_start # End time 
+predict_time_sec <- predict_time['elapsed'] # Get time
+
+
+df <- data.frame(matrix(unlist(as.list(predict)), nrow=length(as.list(predict)), byrow=TRUE))
+colnames(df) <- c("prediction")
+
+
+# Get AUC
+library(pROC)
+roc_baseline <- roc(yelp_test$ch_in,df$prediction, percent=TRUE, plot=TRUE, print.auc=TRUE,grid=TRUE)
+
+
+# Adjust prediction here
+yelp_test$predict_rf <- factor(ifelse(df$prediction>threshold,1,0),labels=c("No ch_in","ch_in"))
+
+### Check accuracy with the confusion matrix ####
+library(caret)
+conf_matrix <- confusionMatrix(yelp_test$predict_rf,factor(yelp_test$ch_in,labels=c("No ch_in","ch_in")), 
+                               positive="ch_in",dnn = c("Prediction", "Actual Data"))
+
+
+# Get relevant measures
+auc <- roc_baseline$auc
+accuracy <- conf_matrix$overall["Accuracy"]
+sensitivity <- conf_matrix$byClass["Sensitivity"]
+specificity <- conf_matrix$byClass["Specificity"]
+precision <- conf_matrix$byClass["Precision"]
+f1 <- conf_matrix$byClass["F1"]
+
+# Store results in results_df
+results_df$model_type[algo_num] <- model_type
+results_df$auc[algo_num] <- auc
+results_df$accuracy[algo_num] <- accuracy
+results_df$sensitivity[algo_num] <- sensitivity
+results_df$specificity[algo_num] <- specificity
+results_df$precision[algo_num] <- precision
+results_df$f1[algo_num] <- f1
+results_df$training_time[algo_num] <- train_time_sec
+results_df$prediction_time[algo_num] <- predict_time_sec
+
+
+####### 3) End of Support Vector Machines ############################################################
+
